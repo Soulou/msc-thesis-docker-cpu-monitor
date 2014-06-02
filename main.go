@@ -1,29 +1,55 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	docker "github.com/fsouza/go-dockerclient"
 )
 
-var startMonitoringTime time.Time
+const (
+	dockerCgroupPath  = "/sys/fs/cgroup/cpuacct/docker"
+	systemdCgroupPath = "/sys/fs/cgroup/cpuacct/system.slice"
+)
+
+var (
+	isUsingSystemd          bool
+	systemdDirnameRegexp    = regexp.MustCompile("docker-[a-f0-9]+.scope")
+	dockerContainerIDRegexp = regexp.MustCompile("[a-f0-9]{64}")
+	startMonitoringTime     time.Time
+)
 
 func main() {
-	cgroupPath := "/cgroup"
-	if os.Getenv("CGROUP_PATH") != "" {
-		cgroupPath = os.Getenv("CGROUP_PATH")
+	cgroupPath := dockerCgroupPath
+
+	flag.StringVar(&dockerHost, "docker-host", dockerHost, "Docker host (unix socket or tcp endpoint)")
+	customCgroupPath := flag.String("cgroup-path", dockerCgroupPath, "Path to the cpuacct cgroup subgroup directory")
+	flag.BoolVar(&isUsingSystemd, "use-systemd", false, "Adapt path to systemd scheme to access cpuacct files")
+	flag.Parse()
+
+	if isUsingSystemd {
+		cgroupPath = systemdCgroupPath
 	}
 
-	dockerCPUAcctDir, err := os.Open(cgroupPath + "/cpuacct/docker")
+	if *customCgroupPath != dockerCgroupPath {
+		cgroupPath = *customCgroupPath
+	}
+
+	_, err := os.Stat(cgroupPath)
+	if os.IsNotExist(err) {
+		log.Fatalln("Cgroup directory", cgroupPath, "doesn't exist")
+	}
+
+	dockerCPUAcctDir, err := os.Open(cgroupPath)
 	if err != nil {
 		panic(err)
 	}
@@ -36,6 +62,10 @@ func main() {
 	containerCPUAcctDirs := make([]os.FileInfo, 0)
 	for _, fi := range containerCPUAcctFiles {
 		if fi.IsDir() {
+			// If systemd is used we just want the containers
+			if isUsingSystemd && !systemdDirnameRegexp.MatchString(fi.Name()) {
+				continue
+			}
 			containerCPUAcctDirs = append(containerCPUAcctDirs, fi)
 		}
 	}
@@ -44,7 +74,7 @@ func main() {
 	wg := &sync.WaitGroup{}
 	stop := make(chan struct{})
 	startMonitoringTime = time.Now()
-	valuesChans := make([]chan float64, len(containerCPUAcctDirs))
+	containerMonitors := make([]*ContainerMonitor, len(containerCPUAcctDirs))
 	nextChans := make([]chan struct{}, len(containerCPUAcctDirs))
 	ticker := time.NewTicker(1 * time.Second)
 
@@ -52,7 +82,7 @@ func main() {
 	for i, containerCPUAcctDir := range containerCPUAcctDirs {
 		wg.Add(1)
 		nextChans[i] = make(chan struct{}, 1)
-		appName, valuesChans[i] = monitorCPUAcct(dockerCPUAcctDir.Name()+"/"+containerCPUAcctDir.Name(), nextChans[i], stop)
+		appName, containerMonitors[i] = monitorCPUAcct(dockerCPUAcctDir.Name()+"/"+containerCPUAcctDir.Name(), nextChans[i], stop)
 		fmt.Printf(" %s", appName)
 		wg.Done()
 	}
@@ -73,18 +103,32 @@ func main() {
 			os.Exit(0)
 		case t := <-ticker.C:
 			fmt.Printf("%v", int(t.Sub(startMonitoringTime).Seconds()))
-			for i, c := range valuesChans {
-				nextChans[i] <- struct{}{}
-				fmt.Printf(" %2.2f%%", <-c)
+			for i, cm := range containerMonitors {
+				if !cm.closed {
+					nextChans[i] <- struct{}{}
+					fmt.Printf(" %2.2f%%", <-cm.valuesChan)
+				} else {
+					fmt.Printf("  end ")
+				}
 			}
 			fmt.Println()
 		}
 	}
 }
 
-func monitorCPUAcct(containerCPUAcctDir string, next chan struct{}, stopChan chan struct{}) (string, chan float64) {
+type ContainerMonitor struct {
+	valuesChan chan float64
+	closed     bool
+}
+
+func monitorCPUAcct(containerCPUAcctDir string, next chan struct{}, stopChan chan struct{}) (string, *ContainerMonitor) {
 	// nbCPUs := runtime.NumCPU()
-	containerID := path.Base(containerCPUAcctDir)
+	var containerID string
+	if isUsingSystemd {
+		containerID = dockerContainerIDRegexp.FindString(containerCPUAcctDir)
+	} else {
+		containerID = path.Base(containerCPUAcctDir)
+	}
 	containerCommand := containerCommand(containerID)
 	containerCPUShares := containerCPUShares(containerID)
 
@@ -95,9 +139,16 @@ func monitorCPUAcct(containerCPUAcctDir string, next chan struct{}, stopChan cha
 		}
 	}
 
-	values := make(chan float64, 5)
+	cm := &ContainerMonitor{
+		valuesChan: make(chan float64, 5),
+	}
 
 	go func() {
+		defer func() {
+			cm.closed = true
+			close(cm.valuesChan)
+		}()
+
 		previousValue := 0
 
 		for {
@@ -107,27 +158,23 @@ func monitorCPUAcct(containerCPUAcctDir string, next chan struct{}, stopChan cha
 			case <-next:
 				usage, err := ioutil.ReadFile(containerCPUAcctDir + "/cpuacct.usage")
 				if err != nil {
-					fmt.Println("End of monitoring for", containerCPUAcctDir)
 					return
 				}
 				usageInt, err := strconv.Atoi(strings.TrimRight(string(usage), "\n"))
 				if err != nil {
 					panic(err)
 				}
-				values <- (float64(usageInt-previousValue) / float64(time.Second) * 100.0)
+				cm.valuesChan <- (float64(usageInt-previousValue) / float64(time.Second) * 100.0)
 				previousValue = usageInt
 			}
 		}
 	}()
 
-	return fmt.Sprintf("cpu-%v-%v", nbCPUs, containerCPUShares), values
+	return fmt.Sprintf("cpu-%v-%v", nbCPUs, containerCPUShares), cm
 }
 
 func containerCommand(id string) string {
-	client, err := docker.NewClient("unix:///docker.sock")
-	if err != nil {
-		panic(err)
-	}
+	client := DockerClient()
 	container, err := client.InspectContainer(id)
 	if err != nil {
 		panic(err)
@@ -140,10 +187,7 @@ func containerCommand(id string) string {
 }
 
 func containerCPUShares(id string) int64 {
-	client, err := docker.NewClient("unix:///docker.sock")
-	if err != nil {
-		panic(err)
-	}
+	client := DockerClient()
 	container, err := client.InspectContainer(id)
 	if err != nil {
 		panic(err)
