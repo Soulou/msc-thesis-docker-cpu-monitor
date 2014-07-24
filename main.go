@@ -83,6 +83,11 @@ func main() {
 		wg.Add(1)
 		nextChans[i] = make(chan struct{}, 1)
 		appName, containerMonitors[i] = monitorCPUAcct(dockerCPUAcctDir.Name()+"/"+containerCPUAcctDir.Name(), nextChans[i], stop)
+
+		// HACKY: Drop first dummy value
+		nextChans[i] <- struct{}{}
+		<-containerMonitors[i].valuesChan
+
 		fmt.Printf(" %s", appName)
 		wg.Done()
 	}
@@ -133,7 +138,7 @@ func monitorCPUAcct(containerCPUAcctDir string, next chan struct{}, stopChan cha
 	containerCPUShares := containerCPUShares(containerID)
 
 	nbCPUs := 1
-	if strings.Contains(containerCommand, "Isolation") {
+	if strings.Contains(containerCommand, "cpu-burn") {
 		if strings.Contains(containerCommand, "-nb-cpus") {
 			nbCPUs, _ = strconv.Atoi(strings.Split(containerCommand, "=")[1])
 		}
@@ -171,26 +176,4 @@ func monitorCPUAcct(containerCPUAcctDir string, next chan struct{}, stopChan cha
 	}()
 
 	return fmt.Sprintf("cpu-%v-%v", nbCPUs, containerCPUShares), cm
-}
-
-func containerCommand(id string) string {
-	client := DockerClient()
-	container, err := client.InspectContainer(id)
-	if err != nil {
-		panic(err)
-	}
-	if len(container.Config.Cmd) == 0 {
-		return strings.Join(container.Config.Entrypoint, " ")
-	} else {
-		return strings.Join(container.Config.Entrypoint, " ") + " " + strings.Join(container.Config.Cmd, " ")
-	}
-}
-
-func containerCPUShares(id string) int64 {
-	client := DockerClient()
-	container, err := client.InspectContainer(id)
-	if err != nil {
-		panic(err)
-	}
-	return container.Config.CpuShares
 }
